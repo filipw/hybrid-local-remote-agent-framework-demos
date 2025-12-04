@@ -1,0 +1,3 @@
+mlx-lm
+python-dotenv
+agent-framework
