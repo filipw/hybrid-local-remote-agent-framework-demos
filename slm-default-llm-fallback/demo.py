@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import AsyncIterable, Any, MutableSequence
 
+from agent_framework_azure_ai import AzureAIAgentClient
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
 
@@ -19,7 +20,7 @@ from agent_framework import (
     AgentRunUpdateEvent, 
     AgentExecutorResponse
 )
-from agent_framework.azure import AzureOpenAIChatClient
+from azure.identity.aio import AzureCliCredential
 from mlx_lm.utils import load
 from mlx_lm.generate import generate, stream_generate
 
@@ -87,18 +88,6 @@ async def main():
     print("   Cascade Pattern with Microsoft Agent Framework")
     print("====================================================\n")
 
-    mlx_client = MLXChatClient("mlx-community/Phi-4-mini-instruct-4bit")
-    
-    aoi_resource = os.getenv("AZURE_OPENAI_RESOURCE")
-    aoi_endpoint = f"https://{aoi_resource}.openai.azure.com" if aoi_resource and not aoi_resource.startswith("http") else aoi_resource
-
-    azure_client = AzureOpenAIChatClient(
-        deployment_name=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
-        endpoint=aoi_endpoint, 
-        api_key=os.getenv("AZURE_OPENAI_KEY"),
-        api_version="2024-06-01"
-    )
-
     queries = [
         # 1. Easy Fact (High Confidence)
         "What is the capital of France?",
@@ -116,46 +105,48 @@ async def main():
         "If I have a cabbage, a goat, and a wolf, and I need to cross a river but can only take one item at a time, and I can't leave the goat with the cabbage or the wolf with the goat, how do I do it?",
     ]
 
+    mlx_client = MLXChatClient("mlx-community/Phi-4-mini-instruct-4bit")    
     for q in queries:
         print(f"\n❔ Query: {q}")
         print("-" * 40)
-        
-        # Agents hold conversation history. Creating them new here ensures they are fresh
-        slm_agent = ChatAgent(
-            name="Local_SLM",
-            instructions="You are a helpful assistant.",
-            chat_client=mlx_client
-        )
+            
+        # Agents hold conversation history, so for each query demoinstration we create a new pair of local/remote agents
+        async with (
+            AzureCliCredential() as credential,
+            AzureAIAgentClient(async_credential=credential).create_agent(
+                name="Cloud_LLM",
+                instructions="You are a fallback expert. The previous assistant was unsure. Provide a complete answer.",
+            ) as cloud_agent,
+        ):
+            local_agent = ChatAgent(
+                name="Local_SLM",
+                instructions="You are a helpful assistant.",
+                chat_client=mlx_client
+            )
 
-        llm_agent = ChatAgent(
-            name="Cloud_LLM",
-            instructions="You are a fallback expert. The previous assistant was unsure. Provide a complete answer.",
-            chat_client=azure_client
-        )
+            builder = WorkflowBuilder()
+            builder.set_start_executor(local_agent)
+            
+            builder.add_edge(
+                source=local_agent,
+                target=cloud_agent,
+                condition=should_fallback_to_cloud
+            )
+            
+            workflow = builder.build()
 
-        builder = WorkflowBuilder()
-        builder.set_start_executor(slm_agent)
-        
-        builder.add_edge(
-            source=slm_agent,
-            target=llm_agent,
-            condition=should_fallback_to_cloud
-        )
-        
-        workflow = builder.build()
-
-        current_agent = None
-        
-        async for event in workflow.run_stream(q):
-            if isinstance(event, AgentRunUpdateEvent):
-                if event.executor_id != current_agent:
-                    if current_agent: print() 
-                    current_agent = event.executor_id
-                    print(f"   🤖 {current_agent}: ", end="", flush=True)
-                
-                if event.data and event.data.text:
-                    print(event.data.text, end="", flush=True)
-        print("\n")
+            current_agent = None
+            
+            async for event in workflow.run_stream(q):
+                if isinstance(event, AgentRunUpdateEvent):
+                    if event.executor_id != current_agent:
+                        if current_agent: print() 
+                        current_agent = event.executor_id
+                        print(f"   🤖 {current_agent}: ", end="", flush=True)
+                    
+                    if event.data and event.data.text:
+                        print(event.data.text, end="", flush=True)
+            print("\n")
 
 if __name__ == "__main__":
     asyncio.run(main())
