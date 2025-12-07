@@ -75,7 +75,7 @@ class MLXStatelessClient(BaseChatClient):
             prompt=prompt, 
             max_tokens=150, 
             verbose=False, 
-            sampler=make_sampler(temp=0.7)
+            sampler=make_sampler(temp=0.5)
         )
         return response_text
 
