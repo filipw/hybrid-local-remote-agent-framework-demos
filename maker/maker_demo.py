@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 # MLX Imports
-from mlx_lm import load, generate, stream_generate
+from mlx_lm import load, generate
 from mlx_lm.sample_utils import make_sampler
 
 # Agent Framework Imports
@@ -48,9 +48,6 @@ class MakerState(BaseModel):
     is_complete: bool = False
 
 class MLXStatelessClient(BaseChatClient):
-    """
-    STRICTLY STATELESS: Processes only the last message.
-    """
     def __init__(self, model_path: str, **kwargs):
         super().__init__(**kwargs)
         print(f"📥 Loading Local Model: {model_path}...")
@@ -73,15 +70,16 @@ class MLXStatelessClient(BaseChatClient):
             self.model, 
             self.tokenizer, 
             prompt=prompt, 
-            max_tokens=150, 
+            max_tokens=300,
             verbose=False, 
-            sampler=make_sampler(temp=0.5)
+            sampler=make_sampler(temp=0.1)
         )
         return response_text
 
 class ManagerClient(BaseChatClient):
     """
-    ORCHESTRATOR LOGIC: Handles the prompt construction for Step 1 vs Step N.
+    UNIVERSAL ORCHESTRATOR: 
+    Instead of forcing time math, this asks the model to update the 'State'.
     """
     def __init__(self, state: MakerState, **kwargs):
         super().__init__(**kwargs)
@@ -94,24 +92,28 @@ class ManagerClient(BaseChatClient):
         if self.state.current_step_idx < len(self.state.steps):
             current_step = self.state.steps[self.state.current_step_idx]
             
+            cot = (
+                "INSTRUCTION: \n"
+                "1. Read the Current Task/Action.\n"
+                "2. Apply this action to the Previous State.\n"
+                "3. Think step-by-step: describe what changes and what stays the same.\n"
+                "4. You MUST end your response with exactly 'Final Answer: [The Updated State or Value]'. Use ONLY the raw state value not any additional expression like 'The Final Answer is...' or 'The updated state is ...'.\n"
+            )
+
             if not self.state.results:
-                # STEP 1: No previous result exists.
-                # We command the model to solve the problem using only the data in the step.
+                # STEP 1
                 prompt = (
                     f"Current Task: {current_step}\n\n"
-                    "INSTRUCTION: Perform the calculation described in the Task. "
-                    "Do NOT look for a 'Previous Result'. Use the numbers provided in the text.\n"
-                    "You MUST end your response with exactly 'Final Answer: HH:MM AM/PM'."
+                    f"{cot}\n"
+                    "Since this is the first step, establish the initial state based on the text."
                 )
             else:
-                # STEP 2+: We have a previous result.
-                # We inject it and command the model to update it.
+                # STEP 2+
                 last_result = self.state.results[-1]
                 prompt = (
-                    f"Previous Result: {last_result}\n"
+                    f"Previous State: {last_result}\n"
                     f"Current Task: {current_step}\n\n"
-                    "INSTRUCTION: Update the 'Previous Result' based on the 'Current Task'.\n"
-                    "You MUST end your response with exactly 'Final Answer: HH:MM AM/PM'."
+                    f"{cot}\n"
                 )
             return prompt
         
@@ -132,11 +134,15 @@ class VotingExecutor(Executor):
         self.state = state
 
     def _extract_answer(self, text: str) -> str:
-        match = re.search(r"Final Answer:\s*(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)", text, re.IGNORECASE)
+        # answer should be in format: Final Answer: [answer], and we trim the [] too
+        match = re.search(r"Final Answer:\s*(.*)", text, re.IGNORECASE)
         if match:
-            raw_time = match.group(1).upper().replace(" ", "")
-            if len(raw_time) == 6: raw_time = "0" + raw_time
-            return raw_time
+            clean = match.group(1).strip().strip('"').strip("'").rstrip(".")
+            if clean.startswith("["):
+                clean = clean[1:]
+            if clean.endswith("]"):
+                clean = clean[:-1]
+            return clean
         return "PARSE_ERROR"
 
     def _get_text_content(self, message: Any) -> str:
@@ -148,10 +154,9 @@ class VotingExecutor(Executor):
     async def process(self, message: object, ctx: WorkflowContext[ChatMessage]):
         input_text = self._get_text_content(message)
         
-        # Visibility: Print the current task intent
         if self.state.attempts == 0 and "Current Task:" in input_text:
             task_line = input_text.split("Current Task:")[1].split("\n")[0].strip()
-            print(f"\n👉 Processing Step {self.state.current_step_idx + 1}: {task_line}")
+            print(f"\n⏳ Processing Step {self.state.current_step_idx + 1}: {task_line}")
 
         msgs = [ChatMessage(role=Role.USER, text=input_text)]
         output_text = await self.client.generate_fast(msgs)
@@ -166,22 +171,23 @@ class VotingExecutor(Executor):
         else:
             self.state.current_votes[ans] += 1
             leader, count = self.state.current_votes.most_common(1)[0]
+            
             runner_up = 0
             if len(self.state.current_votes) > 1:
                 runner_up = self.state.current_votes.most_common(2)[1][1]
-            
             margin = count - runner_up
-            print(f"   🎲 Attempt {self.state.attempts}: {ans} | Leader: {leader} (+{margin})")
+            
+            print(f"   - Attempt {self.state.attempts}: {ans} | Leader (+{margin})")
 
             if margin >= self.state.k_threshold:
-                print(f"   🎉 CONVERGENCE: {leader}")
-                status_msg = f"RESOLVED: {leader}"
-                self._commit_step(leader)
+                print(f"   🎉 CONVERGENCE: {ans}")
+                status_msg = f"RESOLVED: {ans}"
+                self._commit_step(ans)
             
             elif self.state.attempts >= self.state.max_attempts:
-                print(f"   ⚠️ FORCED: {leader}")
-                status_msg = f"RESOLVED: {leader}"
-                self._commit_step(leader)
+                print(f"   ⚠️ FORCED: {ans}")
+                status_msg = f"RESOLVED: {ans}"
+                self._commit_step(ans)
             else:
                 status_msg = "RETRY"
 
@@ -213,7 +219,7 @@ def create_transitions(state: MakerState):
 
 async def main():
     print("====================================================")
-    print("   MAKER Protocol")
+    print("   MAKER Protocol   ")
     print("====================================================\n")
 
     state = MakerState()
@@ -224,11 +230,13 @@ async def main():
         AzureAIAgentClient(async_credential=credential).create_agent(
             name="Cloud_Planner",
             instructions=(
-                "You are a decomposition engine. Your goal is to break a word problem into a sequential list of atomic, self-contained calculation instructions.\n\n"
+                "You are a decomposition engine. Your goal is to break a complex problem into a sequential list of atomic ACTIONABLE instructions.\n\n"
                 "RULES:\n"
-                "1. DATA PRESERVATION: You MUST include the specific numbers, durations, or values from the text in your instructions. Do not say 'Calculate arrival', say 'Add 45 minutes to the time'.\n"
-                "2. DEPENDENCY: Assume the previous step's output is available as 'the previous result'.\n"
+                "1. DATA PRESERVATION: You MUST include the specific objects, names, or values from the text in your instructions.\n"
+                "2. DEPENDENCY: Assuming the previous step output defines the 'State', describe the next ACTION to take on that state.\n"
                 "3. FORMAT: Output ONLY a raw JSON list of strings."
+                "4. SOLUTION MAKING: Do NOT attempt to solve the problem, only decompose it into steps."
+                "5. STATE CHANGING: Each step should modify the state in some way.\n\n"
             ),
         ) as cloud_planner,
     ):
@@ -254,23 +262,15 @@ async def main():
 
         workflow = builder.build()
 
-        user_query = (
-            "A train leaves Station A at 8:15 AM. It takes 45 minutes to reach Station B. "
-            "It stops at Station B for 10 minutes. "
-            "It takes 1 hour and 50 minutes to reach Station C. "
-            "It stops at Station C for 15 minutes. "
-            "It takes 30 minutes to reach Station D. "
-            "What time does the train arrive at Station D?"
-        )
-        
+        user_query = "Calculate ((5 + 3) * 10) / 2. Then divide this result by 4 and add 6."
+
         print(f"🚀 Query: {user_query}")
 
         async for event in workflow.run_stream(user_query):
             if isinstance(event, AgentRunUpdateEvent):
                 if event.executor_id == "Manager" and "WORKFLOW_COMPLETE" in (event.data.text or ""):
                     print(f"\n==========================================")
-                    print(f"🤖 Final Answer: {event.data.text.split(': ')[1]}")
-                    print(f"📝 Correct Answer: 11:45 AM")
+                    print(f"🤖 Final State: {event.data.text.split('WORKFLOW_COMPLETE: ')[1]}")
                     print(f"==========================================")
                     break
 
