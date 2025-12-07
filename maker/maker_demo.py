@@ -213,7 +213,7 @@ def create_transitions(state: MakerState):
 
 async def main():
     print("====================================================")
-    print("   MAKER Protocol: Final Fixed Version")
+    print("   MAKER Protocol")
     print("====================================================\n")
 
     state = MakerState()
