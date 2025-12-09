@@ -2,27 +2,13 @@ import os
 import re
 import asyncio
 import logging
-from typing import AsyncIterable, Any, MutableSequence
-
-from agent_framework_azure_ai import AzureAIAgentClient
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, ValidationError
-
-from agent_framework import (
-    ChatAgent, 
-    ChatMessage, 
-    WorkflowBuilder, 
-    Role,
-    BaseChatClient,
-    ChatResponse,
-    ChatResponseUpdate,
-    ChatOptions,
-    AgentRunUpdateEvent, 
-    AgentExecutorResponse
-)
+from pydantic import BaseModel, Field
+from agent_framework_mlx import MLXChatClient, MLXGenerationConfig
+from agent_framework import ChatAgent, WorkflowBuilder, AgentRunUpdateEvent, AgentExecutorResponse
+from agent_framework.azure import AzureOpenAIChatClient
 from azure.identity.aio import AzureCliCredential
-from mlx_lm.utils import load
-from mlx_lm.generate import generate, stream_generate
+from agent_framework_azure_ai import AzureAIAgentClient
 
 # Suppress warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -40,36 +26,6 @@ class ConfidenceResult(BaseModel):
             return cls(confidence=int(match.group(1)))
         return cls(confidence=0)
 
-class MLXChatClient(BaseChatClient):
-    def __init__(self, model_path: str, **kwargs):
-        super().__init__(**kwargs)
-        print(f"Loading Local Model: {model_path}...")
-        self.model, self.tokenizer = load(model_path) #type: ignore
-    
-    def _prepare_prompt(self, messages: list[ChatMessage]) -> str:
-        msg_dicts = []
-        for m in messages:
-            msg_dicts.append({"role": str(m.role.value), "content": m.text or ""})
-        
-        # Inject instruction into the last message
-        if msg_dicts:
-            msg_dicts[-1]["content"] += "\nIMPORTANT: End response with 'CONFIDENCE: X' (1-10). If you are sure of your answer, you MUST output a score of 8 or higher."
-
-        return self.tokenizer.apply_chat_template(msg_dicts, tokenize=False, add_generation_prompt=True) #type: ignore
-
-    async def _inner_get_response(self, *, messages: MutableSequence[ChatMessage], chat_options: ChatOptions, **kwargs: Any) -> ChatResponse:
-        prompt = self._prepare_prompt(list(messages))
-        response_text = generate(self.model, self.tokenizer, prompt=prompt, max_tokens=300, verbose=False)
-        return ChatResponse(messages=[ChatMessage(role=Role.ASSISTANT, text=response_text)], model_id="phi-4-mini")
-
-    async def _inner_get_streaming_response(self, *, messages: MutableSequence[ChatMessage], chat_options: ChatOptions, **kwargs: Any) -> AsyncIterable[ChatResponseUpdate]:
-        prompt = self._prepare_prompt(list(messages))
-        generation_stream = stream_generate(self.model, self.tokenizer, prompt=prompt, max_tokens=300)
-        
-        for response_chunk in generation_stream:
-            yield ChatResponseUpdate(role=Role.ASSISTANT, text=response_chunk.text, model_id="phi-4-mini")
-            await asyncio.sleep(0)
-
 def should_fallback_to_cloud(message: AgentExecutorResponse) -> bool:
     text = message.agent_run_response.text or ""
     result = ConfidenceResult.parse_from_text(text)
@@ -82,6 +38,10 @@ def should_fallback_to_cloud(message: AgentExecutorResponse) -> bool:
     
     print("   ✅ High Confidence. Workflow Complete.")
     return False
+
+def inject_confidence(msgs): 
+    if msgs: msgs[-1]["content"] += "\nIMPORTANT: End response with 'CONFIDENCE: X' (1-10). If you are sure of your answer, you MUST output a score of 8 or higher."
+    return msgs
 
 async def main():
     print("====================================================")
@@ -105,7 +65,9 @@ async def main():
         "If I have a cabbage, a goat, and a wolf, and I need to cross a river but can only take one item at a time, and I can't leave the goat with the cabbage or the wolf with the goat, how do I do it?",
     ]
 
-    mlx_client = MLXChatClient("mlx-community/Phi-4-mini-instruct-4bit")    
+    mlx_generation_config = MLXGenerationConfig(max_tokens=300)
+    mlx_client = MLXChatClient(model_path="mlx-community/Phi-4-mini-instruct-4bit", generation_config=mlx_generation_config, message_preprocessor=inject_confidence)
+
     for q in queries:
         print(f"\n❔ Query: {q}")
         print("-" * 40)

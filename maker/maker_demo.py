@@ -5,15 +5,9 @@ import asyncio
 import logging
 from collections import Counter
 from typing import Any, List, MutableSequence, AsyncIterable
-
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-
-# MLX Imports
-from mlx_lm import load, generate
-from mlx_lm.sample_utils import make_sampler
-
-# Agent Framework Imports
+from agent_framework_mlx import MLXChatClient, MLXGenerationConfig
 from agent_framework import (
     ChatAgent, 
     ChatMessage,
@@ -46,35 +40,6 @@ class MakerState(BaseModel):
     k_threshold: int = 3
     max_attempts: int = 15
     is_complete: bool = False
-
-class MLXStatelessClient(BaseChatClient):
-    def __init__(self, model_path: str, **kwargs):
-        super().__init__(**kwargs)
-        print(f"📥 Loading Local Model: {model_path}...")
-        self.model, self.tokenizer = load(model_path) #type: ignore
-    
-    def _prepare_prompt(self, messages: list[ChatMessage]) -> str:
-        last_msg = messages[-1]
-        fresh_history = [{"role": "user", "content": last_msg.text or ""}]
-        return self.tokenizer.apply_chat_template(fresh_history, tokenize=False, add_generation_prompt=True) #type: ignore
-
-    async def _inner_get_response(self, *, messages: MutableSequence[ChatMessage], **kwargs) -> ChatResponse:
-        return ChatResponse(messages=[])
-
-    async def _inner_get_streaming_response(self, *, messages: MutableSequence[ChatMessage], chat_options: ChatOptions, **kwargs: Any) -> AsyncIterable[ChatResponseUpdate]:
-        yield ChatResponseUpdate(role=Role.ASSISTANT, text="")
-
-    async def generate_fast(self, messages: list[ChatMessage]) -> str:
-        prompt = self._prepare_prompt(messages)
-        response_text = generate(
-            self.model, 
-            self.tokenizer, 
-            prompt=prompt, 
-            max_tokens=300,
-            verbose=False, 
-            sampler=make_sampler(temp=0.1)
-        )
-        return response_text
 
 class ManagerClient(BaseChatClient):
     """
@@ -128,7 +93,7 @@ class ManagerClient(BaseChatClient):
         yield ChatResponseUpdate(role=Role.ASSISTANT, text=text)
 
 class VotingExecutor(Executor):
-    def __init__(self, name: str, client: MLXStatelessClient, state: MakerState):
+    def __init__(self, name: str, client: BaseChatClient, state: MakerState):
         super().__init__(id=name)
         self.client = client
         self.state = state
@@ -159,9 +124,9 @@ class VotingExecutor(Executor):
             print(f"\n⏳ Processing Step {self.state.current_step_idx + 1}: {task_line}")
 
         msgs = [ChatMessage(role=Role.USER, text=input_text)]
-        output_text = await self.client.generate_fast(msgs)
+        response = await self.client.get_response(msgs)
 
-        ans = self._extract_answer(output_text)
+        ans = self._extract_answer(response.messages[-1].text or "")
         self.state.attempts += 1
         
         status_msg = ""
@@ -217,6 +182,10 @@ def create_transitions(state: MakerState):
     def to_manager(response: AgentExecutorResponse) -> bool: return True
     return parse_plan, to_solver, to_manager
 
+def ensure_stateless(msgs): 
+    trimmed = msgs[-1]
+    return [trimmed]
+        
 async def main():
     print("====================================================")
     print("   MAKER Protocol   ")
@@ -246,7 +215,8 @@ async def main():
             chat_client=ManagerClient(state)
         )
         
-        mlx_client = MLXStatelessClient("mlx-community/Phi-4-mini-instruct-4bit")
+        mlx_generation_config = MLXGenerationConfig(max_tokens=300, temp=0.8)
+        mlx_client = MLXChatClient(model_path="mlx-community/Phi-4-mini-instruct-4bit", generation_config=mlx_generation_config, message_preprocessor=ensure_stateless)
         
         solver = VotingExecutor(
             name="Voting_Solver", 
